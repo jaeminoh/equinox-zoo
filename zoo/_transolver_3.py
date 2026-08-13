@@ -230,7 +230,7 @@ class MLP(eqx.Module):
         act = _ACTIVATION[self.act]
 
         def apply(lin, t):
-            jax.vmap(jax.vmap(lin))(t)
+            return jax.vmap(jax.vmap(lin))(t)
 
         x = act(apply(self.linear_pre, x))
         for linear in self.linears:
