@@ -1,8 +1,9 @@
+from typing import Union
+
 import equinox as eqx
 import jax.numpy as jnp
 import jax.random as jr
 import jax.tree_util as jtu
-from typing import Union
 from jaxtyping import PRNGKeyArray, Float, ArrayLike, jaxtyped
 from beartype import beartype
 
@@ -65,7 +66,7 @@ class Siren(MultiLayerPerceptron):
     ):
         super().__init__(d_in=d_in, width=width, depth=depth, d_out=d_out, key=key)
         self.w0 = w0
-        self = convert_mlp_to_siren(self, key)
+        self.layers = _convert_mlp_to_siren(self, key).layers
 
     @jaxtyped(typechecker=beartype)
     def __call__(self, x: Float[ArrayLike, "..."]) -> Float[ArrayLike, "..."]:
@@ -124,7 +125,7 @@ def _siren_init(mlp: MultiLayerPerceptron, key: PRNGKeyArray = jr.key(4123)):
     return mlp
 
 
-def convert_mlp_to_siren(net: eqx.Module, key=jr.key(4321)):
+def _convert_mlp_to_siren(net: eqx.Module, key=jr.key(4321)):
     def is_mlp(mlp: MultiLayerPerceptron):
         return isinstance(mlp, MultiLayerPerceptron)
 
