@@ -401,17 +401,20 @@ def _is_linear(x):
 
 def init_weights(model: eqx.Module, *, key: Key) -> eqx.Module:
     """Truncated-normal(std=0.02) weights and zero biases on every `Linear`,
-    plus orthogonal initialization for each `in_project_slice`."""
+    `in_project_slice` included: the reference initializes it orthogonally in
+    the attention layer, then overwrites that in `Model.initialize_weights`."""
 
     def get_linears(m):
         return [x for x in jax.tree.leaves(m, is_leaf=_is_linear) if _is_linear(x)]
 
     linears = get_linears(model)
-    keys = jr.split(key, len(linears) + 1)
+    keys = jr.split(key, len(linears))
+    std = 0.02
 
     def _reinit(linear, k):
-        # torch's trunc_normal_ truncates at +-2 std by default
-        weight = jr.truncated_normal(k, -2.0, 2.0, linear.weight.shape) * 0.02
+        # torch's trunc_normal_ cuts at the absolute values +-2, i.e. +-100 std.
+        shape, dtype = linear.weight.shape, linear.weight.dtype
+        weight = jr.truncated_normal(k, -2.0 / std, 2.0 / std, shape, dtype) * std
         linear = eqx.tree_at(lambda lin: lin.weight, linear, weight)
         if linear.bias is not None:
             linear = eqx.tree_at(
@@ -419,30 +422,9 @@ def init_weights(model: eqx.Module, *, key: Key) -> eqx.Module:
             )
         return linear
 
-    model = eqx.tree_at(
+    return eqx.tree_at(
         get_linears, model, [_reinit(lin, k) for lin, k in zip(linears, keys)]
     )
-
-    # Orthogonal init for the slice projections.
-    def get_slice_weights(m):
-        return [
-            x.in_project_slice.weight
-            for x in jax.tree.leaves(
-                m, is_leaf=lambda y: isinstance(y, PhysicsAttentionIrregularMesh)
-            )
-            if isinstance(x, PhysicsAttentionIrregularMesh)
-        ]
-
-    slice_weights = get_slice_weights(model)
-    if slice_weights:
-        ortho = jax.nn.initializers.orthogonal()
-        ks = jr.split(keys[-1], len(slice_weights))
-        model = eqx.tree_at(
-            get_slice_weights,
-            model,
-            [ortho(k, w.shape) for w, k in zip(slice_weights, ks)],
-        )
-    return model
 
 
 if __name__ == "__main__":
