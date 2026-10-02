@@ -544,6 +544,18 @@ def test_attention_is_permutation_equivariant():
     assert np.allclose(np.asarray(out_perm), np.asarray(out[:, perm]), atol=TOL)
 
 
+def test_model_is_permutation_equivariant():
+    key = jr.key(0)
+    model = init_weights(make_jax_model(key), key=jr.fold_in(key, 1))
+    x = jr.normal(jr.fold_in(key, 2), (BATCH, NUM_POINTS, IN_DIM))
+    perm = jr.permutation(jr.fold_in(key, 3), NUM_POINTS)
+
+    out = model(x, key=jr.fold_in(key, 4), inference=True)
+    out_perm = model(x[:, perm], key=jr.fold_in(key, 4), inference=True)
+
+    assert np.allclose(np.asarray(out_perm), np.asarray(out[:, perm]), atol=TOL)
+
+
 # ---------------------------------------------------------------------------
 # Copying PyTorch weights into the Equinox model
 # ---------------------------------------------------------------------------

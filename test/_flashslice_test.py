@@ -848,6 +848,58 @@ def test_fused_switch_keeps_the_parameters():
 
 
 # ---------------------------------------------------------------------------
+# Permutation symmetry over the points
+# ---------------------------------------------------------------------------
+PERM = jr.permutation(jr.key(9), N)
+
+
+def test_slice_is_permutation_invariant_and_deslice_equivariant():
+    """Points only enter through sums over them (slice) and per-point maps
+    (deslice); tiling changes the summation order, nothing else."""
+    leaves, _ = make_leaves("per-head", True)
+    x, fx, w, b, tau, tokens = (
+        leaves[k] for k in ("x", "fx", "w", "b", "tau", "tokens")
+    )
+    for got, expected in zip(
+        fused_slice(x[:, PERM], fx[:, PERM], w, b, tau, chunk_size=8),
+        fused_slice(x, fx, w, b, tau, chunk_size=8),
+    ):
+        assert_close(got, expected)
+    assert_close(
+        fused_deslice(x[:, PERM], w, b, tau, tokens, chunk_size=8),
+        fused_deslice(x, w, b, tau, tokens, chunk_size=8)[:, PERM],
+    )
+
+
+@pytest.mark.parametrize("name,fused", CASES)
+def test_model_is_permutation_equivariant(name, fused):
+    """Permuting the points permutes the prediction, for every ablation on
+    both paths; the fused one with points crossing tile boundaries."""
+    model = JaxTransolver(
+        space_dim=SPACE_DIM,
+        fun_dim=FUN_DIM,
+        out_dim=OUT_DIM,
+        num_layers=NUM_LAYERS,
+        hidden_dim=HIDDEN_DIM,
+        num_heads=NUM_HEADS,
+        num_slices=NUM_SLICES,
+        mlp_ratio=MLP_RATIO,
+        use_fused_slice=fused,
+        chunk_size=CHUNK,
+        key=jr.key(0),
+        **CONFIGS[name][1],
+    )
+    model = init_weights(model, key=jr.key(1))
+    x = jr.normal(jr.key(2), (BATCH, NUM_POINTS, SPACE_DIM))
+    fx = jr.normal(jr.key(3), (BATCH, NUM_POINTS, FUN_DIM))
+    perm = jr.permutation(jr.key(4), NUM_POINTS)
+
+    out = model(x, fx, key=jr.key(5), inference=True)
+    out_perm = model(x[:, perm], fx[:, perm], key=jr.key(5), inference=True)
+    assert_close(out_perm, out[:, perm])
+
+
+# ---------------------------------------------------------------------------
 # Standalone Equinox behaviour
 # ---------------------------------------------------------------------------
 def test_at_most_one_ablation_flag():
