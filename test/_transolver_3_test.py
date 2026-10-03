@@ -472,10 +472,45 @@ def test_init_weights_preserves_structure():
 
     assert out.shape == (BATCH, NUM_POINTS, OUT_DIM)
     assert jnp.isfinite(out).all()
-    # Orthogonal slice projections: W W^T = I with W of shape (G, D), G <= D.
-    for block in model.blocks:
-        w = block.attn.in_project_slice.weight
-        assert np.allclose(w @ w.T, np.eye(NUM_SLICES), atol=1e-5)
+
+
+def test_init_weights_matches_reference_scheme():
+    """Every `Linear` weight, `in_project_slice` included, is N(0, 0.02^2) as in
+    the reference: its orthogonal init is overwritten by `initialize_weights`,
+    and `trunc_normal_` cuts at +-2 absolute, far outside +-2 std."""
+    torch.manual_seed(0)
+    torch_model = Model(
+        space_dim=SPACE_DIM,
+        n_layers=NUM_LAYERS,
+        n_hidden=HIDDEN_DIM,
+        n_head=NUM_HEADS,
+        fun_dim=FUN_DIM,
+        out_dim=OUT_DIM,
+        slice_num=NUM_SLICES,
+    )
+    torch_linears = [m for m in torch_model.modules() if isinstance(m, nn.Linear)]
+    model = init_weights(make_jax_model(jr.key(0)), key=jr.key(1))
+    jax_linears = [
+        x
+        for x in jax.tree.leaves(model, is_leaf=lambda y: isinstance(y, eqx.nn.Linear))
+        if isinstance(x, eqx.nn.Linear)
+    ]
+    assert len(jax_linears) == len(torch_linears)
+
+    def weight_std(weights):
+        return np.concatenate([np.ravel(w) for w in weights]).std()
+
+    torch_std = weight_std(m.weight.detach().numpy() for m in torch_linears)
+    jax_std = weight_std(lin.weight for lin in jax_linears)
+    assert abs(torch_std - 0.02) < 5e-4 and abs(jax_std - 0.02) < 5e-4
+    for lin in jax_linears:
+        assert lin.bias is None or not jnp.any(lin.bias)
+    for block, torch_block in zip(model.blocks, torch_model.blocks):
+        w = np.asarray(block.attn.in_project_slice.weight)
+        w_torch = torch_block.Attn.in_project_slice.weight.detach().numpy()
+        # Neither is orthogonal: W W^T is ~0.02^2 * D I, not I.
+        assert not np.allclose(w_torch @ w_torch.T, np.eye(NUM_SLICES), atol=0.1)
+        assert not np.allclose(w @ w.T, np.eye(NUM_SLICES), atol=0.1)
 
 
 def test_gradients_are_finite():
@@ -505,6 +540,18 @@ def test_attention_is_permutation_equivariant():
 
     out = attn(x, key=jr.fold_in(key, 3), inference=True)
     out_perm = attn(x[:, perm], key=jr.fold_in(key, 3), inference=True)
+
+    assert np.allclose(np.asarray(out_perm), np.asarray(out[:, perm]), atol=TOL)
+
+
+def test_model_is_permutation_equivariant():
+    key = jr.key(0)
+    model = init_weights(make_jax_model(key), key=jr.fold_in(key, 1))
+    x = jr.normal(jr.fold_in(key, 2), (BATCH, NUM_POINTS, IN_DIM))
+    perm = jr.permutation(jr.fold_in(key, 3), NUM_POINTS)
+
+    out = model(x, key=jr.fold_in(key, 4), inference=True)
+    out_perm = model(x[:, perm], key=jr.fold_in(key, 4), inference=True)
 
     assert np.allclose(np.asarray(out_perm), np.asarray(out[:, perm]), atol=TOL)
 
