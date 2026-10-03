@@ -19,15 +19,16 @@ Both of its parts are ported:
    (at most one at a time) and `use_fused_slice` as an implementation switch: the
    fused and eager paths compute the same function from the same parameters.
 
-What is specific to Triton and CUDA is not ported: the tuned tile tables, the
-dot-precision modes (pass `precision` to the ops, or use
-`jax.default_matmul_precision`), and the G-blocked kernel family with its saved
-softmax statistics (`stats=` / `return_stats=`). That family exists because a
-Triton tile holds at most 128 slots in registers; an XLA tile has no such limit,
-so every tile here holds the whole slot axis, as the reference's single-tile
-kernels do, and `chunk_size` bounds the `(B, H, chunk_size, G)` working set for
-any `G`. The reference's eager fallback for head widths above 256 is unnecessary
-for the same reason.
+The reference's single-tile Triton kernels themselves, with their tile tables
+and dot-precision modes, run through jax-triton with `backend="triton"` on the
+ops and the models (`zoo/_flashslice_triton.py`; CUDA only). Not ported: the
+G-blocked kernel family with its saved softmax statistics (`stats=` /
+`return_stats=`). That family exists because a Triton tile holds at most 128
+slots in registers; the pure-JAX path has no such limit, since each of its tiles
+holds the whole slot axis and `chunk_size` bounds the `(B, H, chunk_size, G)`
+working set for any `G`, so it serves every shape the Triton path does not. The
+reference's eager fallback for head widths above 256 is unnecessary for the same
+reason.
 
 Arrays carry an explicit leading batch axis, mirroring the PyTorch reference in
 `test/_flashslice_test.py`, as `zoo/_transolver_3.py` does.
@@ -46,6 +47,7 @@ from ._transolver_3 import MLP
 
 # Added to the slice mass before normalizing the tokens, as in the reference.
 _SLICE_EPS = 1e-5
+_BACKENDS = ("jax", "triton")
 
 
 # ---------------------------------------------------------------------------
@@ -215,12 +217,13 @@ def _deslice_bwd(chunk_size, precision, residuals, d_out):
 _deslice.defvjp(_deslice_fwd, _deslice_bwd)
 
 
-def _broadcast_projection(x_mid, weight, bias, tau, chunk_size):
-    """Validate the slice projection and broadcast it to `(B, H, G, D)` and
-    `(B, H, G)`; autodiff sums the gradients back to the shapes given."""
+def _check_projection(x_mid, weight, bias, tau, chunk_size, backend):
+    """Validate the slice projection against `x_mid`; a `None` bias becomes zeros."""
+    if backend not in _BACKENDS:
+        raise ValueError(f"backend must be one of {_BACKENDS}, got {backend!r}")
     if chunk_size < 1:
         raise ValueError(f"chunk_size must be positive, got {chunk_size}")
-    B, _, H, D = x_mid.shape
+    _, _, H, D = x_mid.shape
     if weight.ndim not in (2, 3, 4) or weight.shape[-1] != D:
         raise ValueError(
             f"weight must be (G, D), (H, G, D) or (B, H, G, D) with D={D}, "
@@ -236,6 +239,14 @@ def _broadcast_projection(x_mid, weight, bias, tau, chunk_size):
         )
     if tau.shape != (H,):
         raise ValueError(f"tau must have shape ({H},), got {tau.shape}")
+    return weight, bias
+
+
+def _broadcast(x_mid, weight, bias):
+    """The projection at `(B, H, G, D)` and `(B, H, G)` for the pure-JAX path;
+    autodiff sums the gradients back to the shapes given."""
+    B, _, H, D = x_mid.shape
+    G = weight.shape[-2]
     return jnp.broadcast_to(weight, (B, H, G, D)), jnp.broadcast_to(bias, (B, H, G))
 
 
@@ -248,6 +259,8 @@ def fused_slice(
     *,
     chunk_size: int = 4096,
     precision=None,
+    backend: str = "jax",
+    dot: str = "ieee",
 ) -> tuple[Float[Array, "B H G DV"], Float[Array, "B H G"]]:
     """
     Pool point features into `G` tokens per head without materializing the
@@ -264,6 +277,13 @@ def fused_slice(
     - `chunk_size`: Points per tile, bounding the `(B, H, chunk_size, G)` working
       set of either pass.
     - `precision`: Passed to every contraction, as in `jnp.einsum`.
+    - `backend`: `"jax"`, the streamed pure-JAX implementation, or `"triton"`,
+      the reference's single-tile Triton kernels through jax-triton (CUDA only;
+      `D` and `G` powers of two in [16, 128], `DV == D`). `chunk_size` and
+      `precision` apply to the first, `dot` to the second.
+    - `dot`: Dot precision of the Triton kernels, as the reference's
+      `set_dot_mode`: `"ieee"` (exact fp32), `"tf32"`, `"bf16v"`, `"bf16"` or
+      `"tf32x3"`; accumulation is fp32 in every mode.
 
     **Returns:**
     `z_num` and `s`, accumulated in at least fp32; normalize outside as
@@ -273,7 +293,12 @@ def fused_slice(
         raise ValueError(
             f"fx_mid {fx_mid.shape} and x_mid {x_mid.shape} disagree on (B, N, H)"
         )
-    weight, bias = _broadcast_projection(x_mid, weight, bias, tau, chunk_size)
+    weight, bias = _check_projection(x_mid, weight, bias, tau, chunk_size, backend)
+    if backend == "triton":
+        from ._flashslice_triton import slice_op
+
+        return slice_op(x_mid, fx_mid, weight, bias, tau, dot=dot)
+    weight, bias = _broadcast(x_mid, weight, bias)
     return _slice(x_mid, fx_mid, weight, bias, tau, chunk_size, precision)
 
 
@@ -286,11 +311,14 @@ def fused_deslice(
     *,
     chunk_size: int = 4096,
     precision=None,
+    backend: str = "jax",
+    dot: str = "ieee",
 ) -> Float[Array, "B N H DV"]:
     """
     Broadcast tokens back to the points without materializing the slice
     weights: `out[n] = sum_g w[n, g] tokens[g]`. `weight`, `bias`, `tau`,
-    `chunk_size` and `precision` are as in `fused_slice`; a tied coupling passes
+    `chunk_size`, `precision`, `backend` and `dot` are as in `fused_slice`; a
+    tied coupling passes
     the slice's own projection and temperature.
 
     **Returns:**
@@ -301,7 +329,12 @@ def fused_deslice(
     G = weight.shape[-2]
     if tokens.shape[:3] != (B, H, G):
         raise ValueError(f"tokens must be ({B}, {H}, {G}, DV), got {tokens.shape}")
-    weight, bias = _broadcast_projection(x_mid, weight, bias, tau, chunk_size)
+    weight, bias = _check_projection(x_mid, weight, bias, tau, chunk_size, backend)
+    if backend == "triton":
+        from ._flashslice_triton import deslice_op
+
+        return deslice_op(x_mid, weight, bias, tau, tokens, dot=dot)
+    weight, bias = _broadcast(x_mid, weight, bias)
     return _deslice(x_mid, weight, bias, tau, tokens, chunk_size, precision)
 
 
@@ -343,6 +376,8 @@ class PhysicsAttentionIrregularMesh(eqx.Module):
     no_token_attention: bool = eqx.field(static=True)
     use_fused_slice: bool = eqx.field(static=True)
     chunk_size: int = eqx.field(static=True)
+    backend: str = eqx.field(static=True)
+    dot: str = eqx.field(static=True)
 
     def __init__(
         self,
@@ -356,6 +391,8 @@ class PhysicsAttentionIrregularMesh(eqx.Module):
         slice_head_dim: int | None = None,
         use_fused_slice: bool = False,
         chunk_size: int = 4096,
+        backend: str = "jax",
+        dot: str = "ieee",
         *,
         key: Key,
     ):
@@ -374,6 +411,8 @@ class PhysicsAttentionIrregularMesh(eqx.Module):
           tokens only. Defaults to `head_dim`, the original layer.
         - `use_fused_slice`: Run slice/deslice through the streamed ops.
         - `chunk_size`: Points per tile of the streamed ops.
+        - `backend`, `dot`: Implementation of the streamed ops, `"jax"` or
+          `"triton"`, and the Triton dot precision; see `fused_slice`.
         """
         slice_head_dim = head_dim if slice_head_dim is None else slice_head_dim
         self.num_heads = num_heads
@@ -383,6 +422,12 @@ class PhysicsAttentionIrregularMesh(eqx.Module):
         self.no_token_attention = no_token_attention
         self.use_fused_slice = use_fused_slice
         self.chunk_size = chunk_size
+        self.backend = backend
+        self.dot = dot
+        if use_fused_slice and backend == "triton":
+            from ._flashslice_triton import check_dims
+
+            check_dims(head_dim, num_slices)
 
         keys = jr.split(key, 9)
         inner_dim = num_heads * head_dim
@@ -430,6 +475,10 @@ class PhysicsAttentionIrregularMesh(eqx.Module):
     def _project_out(self, out_x, *, key, inference):
         return self.dropout(_apply(self.to_out, out_x), key=key, inference=inference)
 
+    @property
+    def _op_options(self):
+        return dict(chunk_size=self.chunk_size, backend=self.backend, dot=self.dot)
+
     def _fused(self, x, *, key, inference):
         B, N, _ = x.shape
         H, D = self.num_heads, self.head_dim
@@ -439,7 +488,7 @@ class PhysicsAttentionIrregularMesh(eqx.Module):
         x_mid = _apply(self.in_project_x, x).reshape(B, N, H, D)
         tau = self.temperature.reshape(H)
         slice_proj = (self.in_project_slice.weight, self.in_project_slice.bias, tau)
-        z_num, s = fused_slice(x_mid, fx_mid, *slice_proj, chunk_size=self.chunk_size)
+        z_num, s = fused_slice(x_mid, fx_mid, *slice_proj, **self._op_options)
         tokens = self._mix(
             z_num / (s + _SLICE_EPS)[..., None], key=mix_key, inference=inference
         )
@@ -454,7 +503,7 @@ class PhysicsAttentionIrregularMesh(eqx.Module):
             )
         else:
             deslice_proj = slice_proj
-        out_x = fused_deslice(x_mid, *deslice_proj, tokens, chunk_size=self.chunk_size)
+        out_x = fused_deslice(x_mid, *deslice_proj, tokens, **self._op_options)
         return self._project_out(
             out_x.reshape(B, N, H * D), key=out_key, inference=inference
         )
@@ -544,6 +593,8 @@ class TransolverBlock(eqx.Module):
         mlp_only: bool = False,
         use_fused_slice: bool = False,
         chunk_size: int = 4096,
+        backend: str = "jax",
+        dot: str = "ieee",
         *,
         key: Key,
     ):
@@ -564,6 +615,8 @@ class TransolverBlock(eqx.Module):
                 slice_head_dim=slice_head_dim,
                 use_fused_slice=use_fused_slice,
                 chunk_size=chunk_size,
+                backend=backend,
+                dot=dot,
                 key=keys[0],
             )
         self.ln_2 = eqx.nn.LayerNorm(hidden_dim)
@@ -712,6 +765,8 @@ class Transolver(eqx.Module):
         mlp_only: bool = False,
         use_fused_slice: bool = False,
         chunk_size: int = 4096,
+        backend: str = "jax",
+        dot: str = "ieee",
         *,
         key: Key,
     ):
@@ -730,6 +785,8 @@ class Transolver(eqx.Module):
           `no_token_attention`, `mlp_only`: The ablation flags, see above.
         - `use_fused_slice`: Run slice/deslice through the streamed ops.
         - `chunk_size`: Points per tile of the streamed ops.
+        - `backend`, `dot`: Implementation of the streamed ops, `"jax"` or
+          `"triton"`, and the Triton dot precision; see `fused_slice`.
         """
         flags = (
             untie_slice_weights,
@@ -792,6 +849,8 @@ class Transolver(eqx.Module):
                     mlp_only=mlp_only,
                     use_fused_slice=use_fused_slice,
                     chunk_size=chunk_size,
+                    backend=backend,
+                    dot=dot,
                     key=k,
                 )
                 for i, k in enumerate(keys[4:])

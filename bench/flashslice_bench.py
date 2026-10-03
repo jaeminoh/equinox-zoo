@@ -1,6 +1,12 @@
 """
 Eager vs fused (FlashSlice) slice/deslice in JAX: step time and peak memory.
 
+Implementations: "eager" materializes the slice weights; "fused" is the
+streamed pure-JAX path (`backend="jax"`); "triton" runs the reference's Triton
+kernels through jax-triton (`backend="triton"`, G and D powers of two in
+[16, 128]; included when jax-triton is importable); "transolver3" is the
+Transolver-3 port, in the full-model sweep.
+
 Meant for a GPU (written with an H100 in mind). Every case runs in its own
 subprocess, so each peak-memory reading starts clean and an out-of-memory case
 is reported as OOM instead of ending the sweep.
@@ -12,6 +18,8 @@ is reported as OOM instead of ending the sweep.
     python bench/flashslice_bench.py --dtype bf16        # bf16 params and inputs
     python bench/flashslice_bench.py --precision highest # exact fp32 dots (no TF32)
     python bench/flashslice_bench.py --quick             # small sizes, smoke test
+    python bench/flashslice_bench.py --mode both         # inference rows too
+    python bench/flashslice_bench.py --dtype bf16 --triton-dot bf16
 
 Columns: median time of a compiled step (ms); peak device memory in use
 (GiB, including parameters and inputs) where the backend reports it, else
@@ -22,6 +30,7 @@ XLA's compiled temp allocation. "train" is forward + backward (`jax.grad`),
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -54,8 +63,10 @@ def run_case(case):
     if case["kind"] == "layer":
         module = PhysicsAttentionIrregularMesh(
             C, H, C // H, G,
-            use_fused_slice=case["impl"] == "fused",
+            use_fused_slice=case["impl"] in ("fused", "triton"),
             chunk_size=case["chunk"],
+            backend="triton" if case["impl"] == "triton" else "jax",
+            dot=case["triton_dot"],
             key=k[0],
         )  # fmt: skip
         inputs = (jr.normal(k[1], (B, N, C)),)
@@ -78,7 +89,10 @@ def run_case(case):
         module = Transolver(
             space_dim=3, fun_dim=1, out_dim=4, num_layers=case["L"],
             hidden_dim=C, num_heads=H, num_slices=G, mlp_ratio=2,
-            use_fused_slice=case["impl"] == "fused", chunk_size=case["chunk"],
+            use_fused_slice=case["impl"] in ("fused", "triton"),
+            chunk_size=case["chunk"],
+            backend="triton" if case["impl"] == "triton" else "jax",
+            dot=case["triton_dot"],
             key=k[0],
         )  # fmt: skip
         module = init_weights(module, key=k[1])
@@ -139,8 +153,10 @@ def spawn(case, timeout):
     err = proc.stderr
     if "RESOURCE_EXHAUSTED" in err or "out of memory" in err.lower():
         return {"error": "OOM"}
-    tail = err.strip().splitlines()[-1:] or ["no output"]
-    return {"error": tail[0][:120]}
+    raised = [ln for ln in err.splitlines() if re.match(r"\w+(Error|Exception)\b", ln)]
+    return {
+        "error": (raised or err.strip().splitlines()[-1:] or ["no output"])[-1][:120]
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +179,9 @@ def cell(r):
 def compare(rows, title, base, out):
     """rows: (label, {impl: case}); prints eager vs fused (and extras)."""
     print(f"\n### {title}\n", flush=True)
-    extras = [i for i in rows[0][1] if i not in ("eager", "fused")]
+    extras = []
+    for _, cases in rows:
+        extras += [i for i in cases if i not in ("eager", "fused", *extras)]
     head = "| case | eager ms | fused ms | speedup | eager GiB | fused GiB | saved |"
     head += "".join(f" {e} ms | {e} GiB |" for e in extras)
     print(head)
@@ -183,8 +201,17 @@ def compare(rows, title, base, out):
             f"| {fmt(me, '.2f')} | {fmt(mf, '.2f')} | {fmt(saved, '.0f')}% |"
         )
         for x in extras:
-            line += f" {cell(res[x])} | {fmt(memory(res[x]), '.2f')} |"
+            r = res.get(x, {"error": "—"})
+            line += f" {cell(r)} | {fmt(memory(r), '.2f')} |"
         print(line, flush=True)
+
+
+def _have_jax_triton():
+    try:
+        import jax_triton  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
 
 def main():
@@ -199,6 +226,20 @@ def main():
         help="jax.default_matmul_precision; 'default' allows TF32 on H100",
     )
     p.add_argument("--chunk", type=int, default=4096, help="fused chunk_size")
+    p.add_argument(
+        "--mode",
+        choices=["train", "infer", "both"],
+        default="train",
+        help="training steps (forward + backward), inference, or both",
+    )
+    p.add_argument(
+        "--triton-dot",
+        choices=["ieee", "tf32", "bf16v", "bf16", "tf32x3"],
+        default=None,
+        help="dot precision of the Triton kernels; default ieee for fp32, bf16 "
+        "for bf16 inputs",
+    )
+    p.add_argument("--no-triton", action="store_true", help="skip the Triton rows")
     p.add_argument("--reps", type=int, default=20)
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--timeout", type=int, default=1800, help="seconds per case")
@@ -210,8 +251,12 @@ def main():
         print("RESULT " + json.dumps(run_case(json.loads(args.case))), flush=True)
         return
 
+    triton_dot = args.triton_dot or ("bf16" if args.dtype == "bf16" else "ieee")
+    use_triton = not args.no_triton and _have_jax_triton()
+    modes = ("train", "infer") if args.mode == "both" else (args.mode,)
     base = dict(
         dtype=args.dtype, precision=args.precision, chunk=args.chunk,
+        triton_dot=triton_dot,
         reps=args.reps, warmup=args.warmup, timeout=args.timeout, C=256, H=8,
     )  # fmt: skip
     if args.quick:
@@ -227,10 +272,17 @@ def main():
         f"dtype={args.dtype} precision={args.precision} chunk_size={args.chunk} "
         f"C=256 H=8 D=32 B=1; results appended to {args.out}"
     )
+    print(
+        f"triton: dot={triton_dot}"
+        if use_triton
+        else "triton: skipped (jax-triton not importable, or --no-triton)"
+    )
 
     def impls(kind, mode, N, G, L=None, t3=False, **extra):
         case = dict(kind=kind, mode=mode, N=N, G=G, L=L, **extra)
         out = {"eager": {**case, "impl": "eager"}, "fused": {**case, "impl": "fused"}}
+        if use_triton and 16 <= G <= 128 and G & (G - 1) == 0:
+            out["triton"] = {**case, "impl": "triton"}
         if t3:
             out["transolver3"] = {**case, "impl": "transolver3"}
         return out
@@ -240,7 +292,7 @@ def main():
             (f"{mode}, N={N // 1024}k, G={G}", impls("layer", mode, N, G))
             for N in layer_ns
             for G in layer_gs
-            for mode in ("train", "infer")
+            for mode in modes
         ]
         compare(rows, "One attention layer", base, args.out)
 
@@ -249,7 +301,7 @@ def main():
             (f"{mode}, N={N // 1024}k, G={G}", impls("model", mode, N, G, 8, t3=True))
             for N in model_ns
             for G in model_gs
-            for mode in ("train", "infer")
+            for mode in modes
         ]
         compare(rows, "Full model, L=8, mlp_ratio=2", base, args.out)
 
